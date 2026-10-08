@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visual Linear Algebra Engine – Real-Time Dashboard</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html,
+    body {
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    canvas {
+      display: block;
+      touch-action: none;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas id="c"></canvas>
+  <script>
+    // ─────────────────────────────────────────────────────────────────────────────
+    // 3BLUE1BROWN PALETTE
+    // ─────────────────────────────────────────────────────────────────────────────
+    const BLUE = '#58C4DD';
+    const ORANGE = '#FC6255';
+    const YELLOW = '#FFFF00';
+    const LGRAY = '#cfcfcf';
+    const MGRAY = '#888888';
+    const DGRAY = '#333333';
+
+    const CV = document.getElementById('c');
+    const X = CV.getContext('2d');
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // STATE
+    // ─────────────────────────────────────────────────────────────────────────────
+    const raw = new Float32Array(784);   // what the user drew
+    let ctr = new Float32Array(784);   // center-of-mass shifted
+    let net = null;                    // model weights from /model
+    let hov = -1;                      // hovered pixel index
+    let down = false;
+    let pendingFetch = false;
+    let lastFetch = 0;
+
+    // live pipeline outputs
+    const RES = {
+      lin: new Float32Array(10),
+      h1: new Float32Array(16),
+      h2: new Float32Array(16),
+      out: new Float32Array(10),
+      ls: new Float32Array(10),
+      pc: [0, 0],
+      nVec: new Float32Array(784),
+      nd: 0
+    };
+
+    // offscreen canvases
+    const tmpl = [];   // 10 diverging heat-maps for W_lin rows
+    const eigC = [];   // eigenvector thumbnails
+    let nullCv = null, pertCv = null, ctrCv = null;
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // UTILITY: 28×28 CANVASES
+    // ─────────────────────────────────────────────────────────────────────────────
+    function mkDivCanvas(row) {
+      const cv = document.createElement('canvas'); cv.width = cv.height = 28;
+      const g = cv.getContext('2d'), im = g.createImageData(28, 28);
+      let mx = 0; for (let i = 0; i < row.length; i++) { const a = Math.abs(row[i]); if (a > mx) mx = a; } mx = mx || 1;
+      for (let i = 0; i < row.length; i++) {
+        const w = row[i], k = Math.abs(w) / mx, q = w > 0 ? [88, 196, 221] : [252, 98, 85];
+        im.data[i * 4] = q[0] * k; im.data[i * 4 + 1] = q[1] * k; im.data[i * 4 + 2] = q[2] * k; im.data[i * 4 + 3] = 255;
+      }
+      g.putImageData(im, 0, 0); return cv;
+    }
+    function mkGrayCanvas(arr) {
+      const cv = document.createElement('canvas'); cv.width = cv.height = 28;
+      const g = cv.getContext('2d'), im = g.createImageData(28, 28);
+      for (let i = 0; i < arr.length; i++) {
+        const k = Math.max(0, Math.min(1, arr[i])) * 255;
+        im.data[i * 4] = k; im.data[i * 4 + 1] = k; im.data[i * 4 + 2] = k; im.data[i * 4 + 3] = 255;
+      }
+      g.putImageData(im, 0, 0); return cv;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // MATH: CLIENT-SIDE NUMPY EQUIVALENTS
+    // ─────────────────────────────────────────────────────────────────────────────
+    function softmax(v) {
+      let mx = -Infinity; for (let i = 0; i < v.length; i++) if (v[i] > mx) mx = v[i];
+      let s = 0; const r = new Float32Array(v.length);
+      for (let i = 0; i < v.length; i++) { r[i] = Math.exp(v[i] - mx); s += r[i]; }
+      for (let i = 0; i < v.length; i++) r[i] /= s || 1; return r;
+    }
+    function matVec(W, b, x, relu) {
+      const R = W.length, C = W[0].length, out = new Float32Array(R);
+      for (let r = 0; r < R; r++) {
+        let s = b ? b[r] : 0; const wr = W[r];
+        for (let c = 0; c < C; c++) s += wr[c] * x[c];
+        out[r] = relu ? Math.max(0, s) : s;
+      } return out;
+    }
+    function centerDigit(src) {
+      let s = 0, cy = 0, cx = 0;
+      for (let y = 0; y < 28; y++) for (let x = 0; x < 28; x++) { const v = src[y * 28 + x]; s += v; cy += y * v; cx += x * v; }
+      const out = new Float32Array(784); if (s < .001) return out;
+      cy /= s; cx /= s;
+      const sy = Math.round(13.5 - cy), sx = Math.round(13.5 - cx);
+      for (let y = 0; y < 28; y++) { const ny = (y - sy + 28) % 28; for (let x = 0; x < 28; x++) { const nx = (x - sx + 28) % 28; out[y * 28 + x] = src[ny * 28 + nx]; } }
+      return out;
+    }
+
+    // Deterministic null vector (same seed every call → stable visual)
+    const SEED_Z = (() => { const z = new Float32Array(784); for (let i = 0; i < 784; i++) z[i] = Math.sin(i * 12.9898 + 78.233); return z; })();
+
+    function computePipeline() {
+      if (!net) return;
+      ctr = centerDigit(raw);
+
+      // 1. Linear layer  y = softmax(W_lin x + b_lin)
+      const zL = matVec(net.L_W, net.L_b, ctr, false);
+      RES.lin = softmax(zL);
+
+      // 2. MLP layer 1  h1 = ReLU(W1 x + b1)
+      const a1 = matVec(net.W1, net.b1, ctr, true);
+      let mx1 = 0; for (let i = 0; i < 16; i++) if (a1[i] > mx1) mx1 = a1[i];
+      for (let i = 0; i < 16; i++) RES.h1[i] = mx1 ? a1[i] / mx1 : 0;
+
+      // 3. MLP layer 2  h2 = ReLU(W2 h1 + b2)
+      const a2 = matVec(net.W2, net.b2, a1, true);
+      let mx2 = 0; for (let i = 0; i < 16; i++) if (a2[i] > mx2) mx2 = a2[i];
+      for (let i = 0; i < 16; i++) RES.h2[i] = mx2 ? a2[i] / mx2 : 0;
+
+      // 4. Output  ŷ = softmax(W3 h2 + b3)
+      RES.out = softmax(matVec(net.W3, net.b3, a2, false));
+
+      // 5. Least squares  ls = LS_W x + LS_b
+      if (net.LS_W) RES.ls = matVec(net.LS_W, net.LS_b, ctr, false);
+
+      // 6. PCA projection  p = (x - μ) · V[:2]ᵀ
+      if (net.mu && net.PC) {
+        let p0 = 0, p1 = 0;
+        const v0 = net.PC[0], v1 = net.PC[1];
+        for (let i = 0; i < 784; i++) { const d = ctr[i] - net.mu[i]; p0 += d * v0[i]; p1 += d * v1[i]; }
+        RES.pc = [p0, p1];
+      }
+
+      // 7. Null vector  n = z - W⁺(W z)
+      if (net.pinv && net.L_W) {
+        const Wz = new Float32Array(10);
+        for (let r = 0; r < 10; r++) { let s = 0; for (let c = 0; c < 784; c++) s += net.L_W[r][c] * SEED_Z[c]; Wz[r] = s; }
+        const n_raw = new Float32Array(784);
+        let mxN = 0;
+        for (let i = 0; i < 784; i++) { let pWz = 0; for (let r = 0; r < 10; r++) pWz += net.pinv[i][r] * Wz[r]; const v = SEED_Z[i] - pWz; n_raw[i] = v; if (Math.abs(v) > mxN) mxN = Math.abs(v); }
+        for (let i = 0; i < 784; i++) RES.nVec[i] = mxN ? 0.4 * n_raw[i] / mxN : 0;
+        let nd = 0;
+        for (let r = 0; r < 10; r++) { let d = 0; for (let c = 0; c < 784; c++) d += net.L_W[r][c] * RES.nVec[c]; if (Math.abs(d) > nd) nd = Math.abs(d); }
+        RES.nd = nd;
+      }
+
+      // Update offscreen canvases
+      ctrCv = mkGrayCanvas(ctr);
+      nullCv = mkDivCanvas(RES.nVec);
+      const prt = new Float32Array(784);
+      for (let i = 0; i < 784; i++) prt[i] = Math.max(0, Math.min(1, ctr[i] + RES.nVec[i]));
+      pertCv = mkGrayCanvas(prt);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // FETCH MODEL WEIGHTS (once on load)
+    // ─────────────────────────────────────────────────────────────────────────────
+    fetch('/model').then(r => r.json()).then(m => {
+      net = m;
+      m.L_W.forEach(r => tmpl.push(mkDivCanvas(r)));
+      if (m.PC) m.PC.forEach(r => eigC.push(mkDivCanvas(r)));
+      computePipeline();
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // LAYOUT — all computed from W×H once per resize
+    // ─────────────────────────────────────────────────────────────────────────────
+    let W = 0, H = 0;
+    let L = {};   // layout object
+
+    function calcLayout() {
+      W = CV.width = window.innerWidth;
+      H = CV.height = window.innerHeight;
+
+      const HDR = 40, FTR = 24;
+      const CY = HDR;       // content top
+      const CH = H - HDR - FTR; // content height
+
+      // Column widths (fixed proportions, minimum sizes)
+      const C1W = Math.max(220, Math.min(270, Math.floor(W * 0.22)));
+      const C3W = Math.max(280, Math.min(360, Math.floor(W * 0.28)));
+      const C2W = W - C1W - C3W;
+
+      // ── Column 1: Drawing pad ──
+      const PAD = Math.min(C1W - 30, CH - 160);
+      const CELL = Math.floor(PAD / 28);
+      const PW = CELL * 28;
+      const PX = C1W / 2 - PW / 2;  // centred in column
+      const PY = CY + 40;
+
+      // ── Column 2 top: Linear map templates ──
+      // Template row: 10 thumbnails of TMPL_S × TMPL_S each, gap TGAP
+      const C2X = C1W;
+      const AVAIL2 = C2W - 24;
+      const TGAP = 6;
+      const TMPL_S = Math.min(42, Math.floor((AVAIL2 - TGAP * 9) / 10));
+      const TROW_W = 10 * (TMPL_S + TGAP) - TGAP;
+      const TROW_X = C2X + (C2W - TROW_W) / 2;  // centered
+      const TROW_Y = CY + 44;                // templates top
+      // Below template: label (14) + bar (28) + pct (14) = 56
+      const SEC1_H = 44 + TMPL_S + 56 + 10;  // header + tmpl row + bar area + margin
+
+      // ── Column 2 bottom: MLP network ──
+      const MLP_Y = CY + SEC1_H;
+      const MLP_H = CH - SEC1_H;
+      // Network x-positions inside C2
+      const NX0 = C2X + Math.floor(C2W * 0.10); // input bundle x
+      const NX1 = C2X + Math.floor(C2W * 0.38); // Layer 1 x
+      const NX2 = C2X + Math.floor(C2W * 0.62); // Layer 2 x
+      const NX3 = C2X + Math.floor(C2W * 0.88); // Output x
+      const NMY = MLP_Y + MLP_H / 2;            // vertical center of MLP area
+      const SP16 = Math.min(16, Math.floor((MLP_H - 60) / 17));
+      const SP10 = Math.min(22, Math.floor((MLP_H - 60) / 11));
+      const NR = Math.min(6, SP16 * 0.38);
+
+      // ── Column 3: Right panels ──
+      const C3X = C1W + C2W;
+      const P1H = Math.floor(CH * 0.30);
+      const P2H = Math.floor(CH * 0.25);
+      const P3H = CH - P1H - P2H;
+
+      L = {
+        HDR, FTR, CY, CH,
+        C1W, C2W, C3W, C2X, C3X,
+        CELL, PW, PX, PY,
+        TMPL_S, TGAP, TROW_X, TROW_Y, SEC1_H,
+        MLP_Y, MLP_H, NX0, NX1, NX2, NX3, NMY, SP16, SP10, NR,
+        P1H, P2H, P3H
+      };
+    }
+    window.addEventListener('resize', calcLayout);
+    calcLayout();
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // INPUT HANDLING
+    // ─────────────────────────────────────────────────────────────────────────────
+    function paint(e) {
+      const rx = e.clientX * (W / window.innerWidth);
+      const ry = e.clientY * (H / window.innerHeight);
+      const fx = (rx - L.PX) / L.CELL - 0.5;
+      const fy = (ry - L.PY) / L.CELL - 0.5;
+      hov = -1;
+      const hix = Math.round(fx), hiy = Math.round(fy);
+      if (hix >= 0 && hix < 28 && hiy >= 0 && hiy < 28) hov = hiy * 28 + hix;
+
+      if (!down) return;
+      if (fx < -1 || fy < -1 || fx > 28 || fy > 28) return;
+      const ix = Math.round(fx), iy = Math.round(fy);
+      let changed = false;
+      for (let j = iy - 2; j <= iy + 2; j++) for (let i = ix - 2; i <= ix + 2; i++) {
+        if (i < 0 || i > 27 || j < 0 || j > 27) continue;
+        const v = 1 - Math.hypot(i - fx, j - fy) / 1.9;
+        if (v > 0) { const idx = j * 28 + i, nv = Math.max(raw[idx], Math.min(1, v * 1.3)); if (nv !== raw[idx]) { raw[idx] = nv; changed = true; } }
+      }
+      if (changed) {
+        computePipeline();
+        const now = performance.now();
+        if (now - lastFetch > 150 && !pendingFetch) { lastFetch = now; bgSync(); }
+      }
+    }
+
+    CV.addEventListener('pointerdown', e => {
+      // Clear button hit-test
+      const bx = L.PX, by = L.PY + L.PW + 18;
+      if (e.clientY >= by && e.clientY <= by + 26 && e.clientX >= bx && e.clientX <= bx + 80) { clearCanvas(); return; }
+      down = true; paint(e);
+    });
+    CV.addEventListener('pointermove', paint);
+    window.addEventListener('pointerup', () => down = false);
+
+    function clearCanvas() { raw.fill(0); computePipeline(); }
+
+    async function bgSync() {
+      if (pendingFetch || !raw.some(v => v > 0)) return;
+      pendingFetch = true;
+      try {
+        const r = await fetch('/predict', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ px: Array.from(raw) }) });
+        const d = await r.json(); if (d) RES.nd = d.nd;
+      } catch (e) { } finally { pendingFetch = false; }
+    }
+
+    window.addEventListener('keydown', e => {
+      if (e.key === 'c' || e.key === 'C') clearCanvas();
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // RENDER HELPERS
+    // ─────────────────────────────────────────────────────────────────────────────
+    function clipCol(x, y, w, h) { X.save(); X.beginPath(); X.rect(x, y, w, h); X.clip(); }
+
+    function divider(x1, y, x2) { X.strokeStyle = '#1c1c1c'; X.lineWidth = 1; X.beginPath(); X.moveTo(x1, y); X.lineTo(x2, y); X.stroke(); }
+    function colLine(x, y1, y2) { X.strokeStyle = '#1a1a1a'; X.lineWidth = 1; X.beginPath(); X.moveTo(x, y1); X.lineTo(x, y2); X.stroke(); }
+
+    function colY16(i) { return L.NMY + (i - (16 - 1) / 2) * L.SP16; }
+    function colY10(i) { return L.NMY + (i - (10 - 1) / 2) * L.SP10; }
+
+    function neuron(cx, cy, brightness, isWin) {
+      X.beginPath(); X.arc(cx, cy, L.NR, 0, Math.PI * 2);
+      X.fillStyle = `rgba(255,255,255,${Math.min(1, brightness)})`; X.fill();
+      X.strokeStyle = isWin ? YELLOW : '#777'; X.lineWidth = isWin ? 2 : 1; X.stroke();
+      if (isWin) { X.beginPath(); X.arc(cx, cy, L.NR + 3, 0, Math.PI * 2); X.strokeStyle = YELLOW; X.lineWidth = 1.5; X.stroke(); }
+    }
+    function label(t, x, y, col, fnt) { X.fillStyle = col || LGRAY; X.font = fnt || '13px Georgia'; X.fillText(t, x, y); }
+    function clabel(t, x, y, col, fnt) { X.fillStyle = col || LGRAY; X.font = fnt || '13px Georgia'; X.textAlign = 'center'; X.fillText(t, x, y); X.textAlign = 'left'; }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 1: HEADER
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawHeader() {
+      X.fillStyle = '#080808'; X.fillRect(0, 0, W, L.HDR);
+      X.strokeStyle = '#222'; X.lineWidth = 1; X.beginPath(); X.moveTo(0, L.HDR); X.lineTo(W, L.HDR); X.stroke();
+      X.fillStyle = '#fff'; X.font = 'bold 14px Georgia'; X.textAlign = 'left';
+      // X.fillText('VISUAL LINEAR ALGEBRA ENGINE', 16, 26);
+      X.fillStyle = '#555'; X.font = '11px monospace';
+      X.fillText('', 310, 26);
+      X.fillStyle = BLUE; X.beginPath(); X.arc(W - 160, 20, 4, 0, Math.PI * 2); X.fill();
+      X.fillStyle = LGRAY; X.font = 'italic 12px Georgia';
+      // X.fillText('Real-Time Inference', W - 148, 24);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 2: LEFT COLUMN
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawLeft() {
+      clipCol(0, L.CY, L.C1W, L.CH);
+
+      // Title
+      X.fillStyle = LGRAY; X.font = 'italic 13px Georgia'; X.textAlign = 'left';
+      X.fillText('1.  x \u2208 \u211D\u2077\u2078\u2074', L.PX, L.CY + 24);
+
+      // Hovered pixel readout
+      if (hov >= 0) {
+        X.fillStyle = YELLOW; X.font = '11px monospace'; X.textAlign = 'right';
+        X.fillText(`x[${hov}]=${raw[hov].toFixed(2)}`, L.PX + L.PW, L.CY + 24);
+        X.textAlign = 'left';
+      }
+
+      // 28×28 grid
+      for (let i = 0; i < 784; i++) {
+        const v = raw[i] * 255 | 0;
+        X.fillStyle = `rgb(${v},${v},${v})`;
+        X.fillRect(L.PX + (i % 28) * L.CELL, L.PY + (i / 28 | 0) * L.CELL, L.CELL - 1, L.CELL - 1);
+      }
+      X.strokeStyle = '#555'; X.lineWidth = 1.5;
+      X.strokeRect(L.PX - 1, L.PY - 1, L.PW + 2, L.PW + 2);
+
+      // Clear button only
+      const BY = L.PY + L.PW + 18;
+      X.fillStyle = '#141414'; X.fillRect(L.PX, BY, 80, 24);
+      X.strokeStyle = '#444'; X.lineWidth = 1; X.strokeRect(L.PX, BY, 80, 24);
+      X.fillStyle = LGRAY; X.font = '11px Georgia'; clabel('Clear  [C]', L.PX + 40, BY + 16);
+
+      // Center-of-mass preview (directly below Clear button)
+      const PREVY = BY + 36;
+      if (ctrCv && PREVY + 52 < L.CY + L.CH) {
+        X.fillStyle = MGRAY; X.font = 'italic 11px Georgia';
+        X.fillText('Centered \u0078\u0302  (COM \u2192 13.5, 13.5):', L.PX, PREVY + 12);
+        X.imageSmoothingEnabled = false;
+        X.drawImage(ctrCv, L.PX, PREVY + 18, 52, 52);
+        X.strokeStyle = '#333'; X.strokeRect(L.PX - 1, PREVY + 17, 54, 54);
+        X.fillStyle = '#666'; X.font = '10px monospace';
+        X.fillText('c\u0305y=\u2211i\u00B7I/\u2211I', L.PX + 62, PREVY + 34);
+        X.fillText('c\u0305x=\u2211j\u00B7I/\u2211I', L.PX + 62, PREVY + 50);
+      }
+
+      // Column separator
+      colLine(L.C1W, L.CY, L.CY + L.CH);
+      X.restore();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 3: CENTER TOP — LINEAR MAP
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawCenterTop() {
+      const { C2X, C2W, CY, TROW_X, TROW_Y, TMPL_S, TGAP, SEC1_H } = L;
+      clipCol(C2X, CY, C2W, SEC1_H);
+
+      // Header
+      X.fillStyle = LGRAY; X.font = 'italic 13px Georgia'; X.textAlign = 'left';
+      X.fillText('2.  Linear Map:  y = softmax(W\u2097\u1D35\u2099 x + b)', C2X + 10, CY + 18);
+      X.fillStyle = MGRAY; X.font = '11px Georgia';
+      X.fillText('Each of 10 rows w\u1D4F of W is a visual template; z\u2096 = w\u1D4F\u1D40 x + b\u2096', C2X + 10, CY + 34);
+
+      // Dividing line under header
+      divider(C2X, CY + 40, C2X + C2W);
+
+      const winL = RES.lin.indexOf(Math.max(...RES.lin));
+
+      for (let k = 0; k < 10; k++) {
+        const tx = TROW_X + k * (TMPL_S + TGAP);
+        const prob = RES.lin[k];
+        const win = k === winL && prob > 0.05;
+
+        // Template
+        if (tmpl[k]) {
+          X.imageSmoothingEnabled = false;
+          X.drawImage(tmpl[k], tx, TROW_Y, TMPL_S, TMPL_S);
+        }
+        X.strokeStyle = win ? YELLOW : '#2a2a2a'; X.lineWidth = win ? 2 : 1;
+        X.strokeRect(tx - 1, TROW_Y - 1, TMPL_S + 2, TMPL_S + 2);
+
+        // Digit label
+        clabel(k + '', tx + TMPL_S / 2, TROW_Y + TMPL_S + 13, win ? YELLOW : LGRAY, win ? 'bold 12px Georgia' : '11px Georgia');
+
+        // Probability bar (grows upward style → here just a thin vertical bar)
+        const BAR_H = 24, BAR_W = 6;
+        const BAR_X = tx + TMPL_S / 2 - BAR_W / 2, BAR_Y = TROW_Y + TMPL_S + 18;
+        X.fillStyle = '#1a1a1a'; X.fillRect(BAR_X, BAR_Y, BAR_W, BAR_H);
+        const fill = Math.round(prob * BAR_H);
+        X.fillStyle = win ? YELLOW : BLUE;
+        X.fillRect(BAR_X, BAR_Y + BAR_H - fill, BAR_W, fill);
+
+        // Percent
+        X.fillStyle = win ? YELLOW : MGRAY; X.font = '10px monospace';
+        clabel(Math.round(prob * 100) + '%', tx + TMPL_S / 2, BAR_Y + BAR_H + 12);
+      }
+
+      // Winner announcement
+      const winProb = RES.lin[winL];
+      if (winProb > 0.1) {
+        X.fillStyle = YELLOW; X.font = 'bold 13px Georgia';
+        X.textAlign = 'right';
+        X.fillText(`→ digit ${winL}   ${Math.round(winProb * 100)}%`, C2X + C2W - 10, CY + 18);
+        X.textAlign = 'left';
+      }
+
+      divider(C2X, CY + SEC1_H - 1, C2X + C2W);
+      X.restore();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 4: CENTER BOTTOM — MLP NETWORK
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawCenterBottom() {
+      const { C2X, C2W, MLP_Y, MLP_H, NX0, NX1, NX2, NX3, NMY, SP16, SP10, NR, SEC1_H, CY, CH } = L;
+      clipCol(C2X, MLP_Y, C2W, MLP_H);
+
+      // Header
+      X.fillStyle = LGRAY; X.font = 'italic 12px Georgia'; X.textAlign = 'left';
+      X.fillText('3.  MLP:  x \u2192 h\u2081=ReLU(W\u2081x+b\u2081) \u2192 h\u2082=ReLU(W\u2082h\u2081+b\u2082) \u2192 \u0177=softmax(W\u2083h\u2082+b\u2083)', C2X + 8, MLP_Y + 16);
+      X.fillStyle = MGRAY; X.font = '10px monospace';
+      X.fillText('Blue = positive weight \u00B7 Orange = negative weight \u00B7 Opacity \u221D |w|', C2X + 8, MLP_Y + 30);
+
+      // ── Connections: input → Layer 1 ──
+      for (let j = 0; j < 16; j++) {
+        const ny = colY16(j), act = RES.h1[j];
+        const al = Math.max(0.04, act * 0.7);
+        X.strokeStyle = BLUE; X.globalAlpha = al; X.lineWidth = 1;
+        X.beginPath(); X.moveTo(NX0 + 12, NMY); X.lineTo(NX1 - NR, ny); X.stroke();
+      }
+      X.globalAlpha = 1;
+
+      // ── Connections: Layer 1 → Layer 2 ──
+      if (net && net.W2) {
+        for (let j = 0; j < 16; j++) {
+          const y2 = colY16(j);
+          for (let i = 0; i < 16; i++) {
+            const y1 = colY16(i);
+            const w = net.W2[j][i] * RES.h1[i];
+            const al = Math.min(0.85, Math.abs(w) * 1.2);
+            if (al < 0.06) continue;
+            X.strokeStyle = w > 0 ? BLUE : ORANGE; X.globalAlpha = al; X.lineWidth = 1;
+            X.beginPath(); X.moveTo(NX1 + NR, y1); X.lineTo(NX2 - NR, y2); X.stroke();
+          }
+        }
+        X.globalAlpha = 1;
+      }
+
+      // ── Connections: Layer 2 → Output ──
+      if (net && net.W3) {
+        for (let j = 0; j < 10; j++) {
+          const y3 = colY10(j);
+          for (let i = 0; i < 16; i++) {
+            const y2 = colY16(i);
+            const w = net.W3[j][i] * RES.h2[i];
+            const al = Math.min(0.85, Math.abs(w) * 1.2);
+            if (al < 0.06) continue;
+            X.strokeStyle = w > 0 ? BLUE : ORANGE; X.globalAlpha = al; X.lineWidth = 1;
+            X.beginPath(); X.moveTo(NX2 + NR, y2); X.lineTo(NX3 - NR, y3); X.stroke();
+          }
+        }
+        X.globalAlpha = 1;
+      }
+
+      // ── Input node ──
+      X.beginPath(); X.arc(NX0, NMY, 12, 0, Math.PI * 2);
+      X.fillStyle = '#111'; X.fill(); X.strokeStyle = BLUE; X.lineWidth = 1.5; X.stroke();
+      X.fillStyle = BLUE; X.font = '9px monospace'; clabel('784', NX0, NMY + 4);
+
+      // ── Layer 1 neurons ──
+      X.fillStyle = MGRAY; X.font = '10px Georgia'; clabel('h\u2081 [16]', NX1, MLP_Y + 44);
+      for (let i = 0; i < 16; i++) neuron(NX1, colY16(i), RES.h1[i], false);
+
+      // ── Layer 2 neurons ──
+      clabel('h\u2082 [16]', NX2, MLP_Y + 44);
+      for (let i = 0; i < 16; i++) neuron(NX2, colY16(i), RES.h2[i], false);
+
+      // ── Output neurons ──
+      const winD = RES.out.indexOf(Math.max(...RES.out));
+      clabel('\u0177 [10]', NX3, MLP_Y + 44);
+      for (let i = 0; i < 10; i++) {
+        const ny = colY10(i), prob = RES.out[i], win = i === winD && prob > 0.05;
+        neuron(NX3, ny, win ? 1 : prob, win);
+        X.fillStyle = win ? YELLOW : LGRAY; X.font = win ? 'bold 11px Georgia' : '10px Georgia'; X.textAlign = 'left';
+        X.fillText(`${i}`, NX3 + NR + 6, ny + 4);
+        X.fillStyle = win ? YELLOW : MGRAY; X.font = '9px monospace';
+        X.fillText(`${Math.round(prob * 100)}%`, NX3 + NR + 20, ny + 4);
+        X.textAlign = 'left';
+      }
+
+      // Equation labels
+      X.fillStyle = MGRAY; X.font = 'italic 10px Georgia';
+      clabel('ReLU', NX1, MLP_Y + MLP_H - 10);
+      clabel('ReLU', NX2, MLP_Y + MLP_H - 10);
+      clabel('softmax', NX3, MLP_Y + MLP_H - 10);
+
+      X.restore();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 5: RIGHT — NULL SPACE
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawRightNull() {
+      const { C3X, C3W, CY, P1H } = L;
+      clipCol(C3X, CY, C3W, P1H);
+      colLine(C3X, CY, CY + L.CH);
+
+      const PD = 12;
+      X.fillStyle = LGRAY; X.font = 'italic 13px Georgia'; X.textAlign = 'left';
+      X.fillText('4.  Null Space & Rank-Nullity', C3X + PD, CY + 18);
+      const rnk = net ? net.rank : 10;
+      X.fillStyle = MGRAY; X.font = '11px monospace';
+      X.fillText(`rank(W)=${rnk}  \u2192  dim(Null)=784-${rnk}=${784 - rnk}`, C3X + PD, CY + 34);
+
+      // Three thumbnails: x, n, x+n
+      const TH = Math.min(56, Math.floor((C3W - PD * 2 - 20) / 3));
+      const TY = CY + 42;
+      const labels = ['x', 'n (Wn=0)', 'x+n'];
+      const canvs = [ctrCv, nullCv, pertCv];
+      for (let i = 0; i < 3; i++) {
+        const tx = C3X + PD + i * (TH + 10);
+        if (canvs[i]) {
+          X.imageSmoothingEnabled = false;
+          X.drawImage(canvs[i], tx, TY, TH, TH);
+        } else {
+          X.fillStyle = '#111'; X.fillRect(tx, TY, TH, TH);
+        }
+        X.strokeStyle = '#333'; X.lineWidth = 1; X.strokeRect(tx - 1, TY - 1, TH + 2, TH + 2);
+        X.fillStyle = i === 1 ? ORANGE : LGRAY; X.font = '9px Georgia';
+        clabel(labels[i], tx + TH / 2, TY + TH + 11);
+      }
+
+      // Numerical proof
+      X.fillStyle = BLUE; X.font = '10px monospace';
+      X.fillText(`\u2016W(x+n)-Wx\u2016 = ${RES.nd.toExponential(1)}`, C3X + PD, TY + TH + 28);
+      X.fillStyle = MGRAY; X.font = 'italic 10px Georgia';
+      X.fillText('Adding 774-dim noise leaves output unchanged', C3X + PD, TY + TH + 42);
+
+      divider(C3X + PD, CY + P1H - 1, C3X + C3W - PD);
+      X.restore();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 6: RIGHT — LEAST SQUARES
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawRightLS() {
+      const { C3X, C3W, CY, P1H, P2H } = L;
+      const SY = CY + P1H;
+      clipCol(C3X, SY, C3W, P2H);
+
+      const PD = 12;
+      X.fillStyle = LGRAY; X.font = 'italic 13px Georgia';
+      X.fillText('5.  Least Squares  W\u2097\u209B = (X\u1D40X)\u207B\u00B9X\u1D40Y', C3X + PD, SY + 18);
+      X.fillStyle = MGRAY; X.font = '10px monospace';
+      X.fillText('min\u2016XW-Y\u2016\u00B2  \u2192  closed form vs gradient descent', C3X + PD, SY + 32);
+
+      const maxLS = Math.max(...RES.ls.map(Math.abs), 1);
+      const winLS = RES.ls.indexOf(Math.max(...RES.ls));
+      const BW = C3W - PD * 2 - 28;
+      const ROW = Math.floor((P2H - 60) / 10);
+
+      for (let k = 0; k < 10; k++) {
+        const by = SY + 40 + k * ROW;
+        const v = RES.ls[k], win = k === winLS;
+        X.fillStyle = MGRAY; X.font = '10px Georgia'; X.fillText(k, C3X + PD, by + ROW - 2);
+        const fw = Math.max(2, Math.round(BW * Math.max(0, v) / maxLS));
+        X.fillStyle = '#181818'; X.fillRect(C3X + PD + 18, by, BW, ROW - 3);
+        X.fillStyle = win ? YELLOW : BLUE; X.fillRect(C3X + PD + 18, by, fw, ROW - 3);
+      }
+
+      if (net && net.acc) {
+        X.fillStyle = LGRAY; X.font = 'italic 10px Georgia';
+        X.fillText(`GD acc: ${(net.acc[0] * 100).toFixed(1)}%   LS acc: ${(net.acc[1] * 100).toFixed(1)}%`, C3X + PD, SY + P2H - 8);
+      }
+
+      divider(C3X + PD, SY + P2H - 1, C3X + C3W - PD);
+      X.restore();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 7: RIGHT — PCA SCATTER
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawRightPCA() {
+      const { C3X, C3W, CY, P1H, P2H, P3H } = L;
+      const SY = CY + P1H + P2H;
+      clipCol(C3X, SY, C3W, P3H);
+
+      const PD = 12;
+      X.fillStyle = LGRAY; X.font = 'italic 13px Georgia';
+      X.fillText('6.  SVD / PCA 2D Subspace', C3X + PD, SY + 16);
+      const vp = net ? (net.var2 * 100).toFixed(0) : '?';
+      X.fillStyle = MGRAY; X.font = '10px monospace';
+      X.fillText(`top 2 eigenvecs capture ${vp}% of variance`, C3X + PD, SY + 30);
+
+      // Square plot that fits
+      const PLOT = Math.min(P3H - 60, C3W - PD * 2 - 80);
+      const PX0 = C3X + PD, PY0 = SY + 38;
+
+      X.strokeStyle = '#2a2a2a'; X.lineWidth = 1; X.strokeRect(PX0, PY0, PLOT, PLOT);
+
+      if (net && net.pts) {
+        const xs = net.pts.map(p => p[0]), ys = net.pts.map(p => p[1]);
+        const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+        const mp = (a, b) => [PX0 + Math.max(0, Math.min(1, (a - minX) / (maxX - minX))) * PLOT,
+        PY0 + PLOT - Math.max(0, Math.min(1, (b - minY) / (maxY - minY))) * PLOT];
+
+        // Reference digit cloud
+        for (let i = 0; i < net.pts.length; i++) {
+          const [px, py] = mp(net.pts[i][0], net.pts[i][1]);
+          X.fillStyle = `hsl(${net.lab[i] * 36},65%,55%)`;
+          X.beginPath(); X.arc(px, py, 1.8, 0, Math.PI * 2); X.fill();
+        }
+
+        // Live drawing coordinate
+        const [ux, uy] = mp(RES.pc[0], RES.pc[1]);
+        X.strokeStyle = '#fff'; X.lineWidth = 3;
+        X.beginPath(); X.arc(ux, uy, 7, 0, Math.PI * 2); X.stroke();
+        X.fillStyle = YELLOW; X.beginPath(); X.arc(ux, uy, 3, 0, Math.PI * 2); X.fill();
+
+        // Digit legend
+        for (let d = 0; d < 10; d++) {
+          X.fillStyle = `hsl(${d * 36},65%,55%)`; X.font = '9px Georgia';
+          X.fillText(d, PX0 + (d + 0.3) * PLOT / 10, PY0 + PLOT + 13);
+        }
+      }
+
+      // Eigenvector thumbnails to the right of plot
+      if (eigC.length) {
+        const EX = PX0 + PLOT + 8;
+        const ES = Math.min(28, Math.floor((C3W - PD - PLOT - 20) / 2) - 4);
+        X.fillStyle = MGRAY; X.font = '9px Georgia'; X.fillText('V\u2081-V\u2084', EX, PY0 + 12);
+        eigC.slice(0, 4).forEach((cv, i) => {
+          const ex = EX + (i % 2) * (ES + 4), ey = PY0 + 16 + Math.floor(i / 2) * (ES + 4);
+          X.imageSmoothingEnabled = false; X.drawImage(cv, ex, ey, ES, ES);
+          X.strokeStyle = '#333'; X.strokeRect(ex, ey, ES, ES);
+        });
+      }
+
+      X.restore();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // SECTION 8: FOOTER
+    // ─────────────────────────────────────────────────────────────────────────────
+    function drawFooter() {
+      const FY = H - L.FTR;
+      X.fillStyle = '#060606'; X.fillRect(0, FY, W, L.FTR);
+      X.strokeStyle = '#1c1c1c'; X.lineWidth = 1; X.beginPath(); X.moveTo(0, FY); X.lineTo(W, FY); X.stroke();
+      X.fillStyle = '#555'; X.font = '11px monospace'; X.textAlign = 'left';
+      X.fillText('Controls: Draw on grid  |  [C] Clear', 16, FY + 17);
+      X.textAlign = 'right';
+      X.fillText('Pure NumPy Backend — Zero ML Frameworks', W - 16, FY + 17);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // MAIN RENDER LOOP (60 FPS)
+    // ─────────────────────────────────────────────────────────────────────────────
+    function frame() {
+      X.fillStyle = '#000'; X.fillRect(0, 0, W, H);
+      X.textAlign = 'left';
+
+      drawHeader();
+      drawLeft();
+      drawCenterTop();
+      drawCenterBottom();
+      drawRightNull();
+      drawRightLS();
+      drawRightPCA();
+      drawFooter();
+
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  </script>
+</body>
+
+</html>
